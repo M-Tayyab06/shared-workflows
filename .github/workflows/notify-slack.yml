@@ -1,0 +1,264 @@
+# =============================================================================
+# notify-slack — REUSABLE WORKFLOW for Slack CI/publish notifications.
+#
+# Lives ONCE in this PUBLIC repo. Any repository on GitHub calls it as a job:
+#
+#   jobs:
+#     slack-notify:
+#       needs: my-publish-job
+#       if: always()
+#       uses: M-Tayyab06/shared-workflows/.github/workflows/notify-slack.yml@v1
+#       with:
+#         status: ${{ needs.my-publish-job.result }}
+#         title: 'My pipeline'
+#       secrets:
+#         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+#         SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+#
+# ⚠ THIS FILE CONTAINS NO SECRETS — and must NEVER contain any. Every caller
+#   brings its own Slack token and channel via the `secrets:` block. That is
+#   what makes it safe to publish this repo publicly.
+#
+# Message shapes:
+#   success + image_ref + image_digest → ":rocket: published" + Docker Hub button
+#   success without digest             → ":white_check_mark: passed"
+#   failure                            → ":x: FAILED" (+ optional blocked reason)
+#   cancelled / skipped                → quiet note, no @channel ping
+#
+# A reusable workflow CANNOT see the caller's steps. Anything the caller wants
+# in the message (image tag, digest, scan count…) must arrive via `with:`.
+#
+# Context note: inside a called workflow, github.repository / github.ref_name /
+# github.actor / github.run_id / github.sha resolve to the CALLER's run — the
+# defaults below are already correct; callers don't pass them.
+#
+# Uses only preinstalled jq + curl — NO third-party actions — so no caller's
+# allowed-actions policy can block it.
+# =============================================================================
+name: Notify Slack (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      status:
+        description: 'success | failure | cancelled | skipped — usually needs.<job>.result'
+        required: true
+        type: string
+      title:
+        description: 'Human name of the pipeline, e.g. "Backend image publish"'
+        required: false
+        type: string
+        default: 'CI pipeline'
+      detail:
+        description: 'One-line explanation (e.g. why a publish was blocked)'
+        required: false
+        type: string
+        default: ''
+      image_ref:
+        description: 'Full image reference repo:tag — empty for non-publish pipelines'
+        required: false
+        type: string
+        default: ''
+      image_tag:
+        description: 'Tag only (drives the Docker Hub deep-link)'
+        required: false
+        type: string
+        default: ''
+      image_digest:
+        description: 'sha256:… — only present when the image was actually pushed'
+        required: false
+        type: string
+        default: ''
+      dockerhub_repo:
+        description: 'Docker Hub repo (org/name) — enables the Docker Hub button'
+        required: false
+        type: string
+        default: ''
+      scan_summary:
+        description: 'Scan verdict text, e.g. "clean — 0 HIGH/CRITICAL"'
+        required: false
+        type: string
+        default: ''
+      ping_channel:
+        description: 'true → <!channel> ping on success and failure'
+        required: false
+        type: string
+        default: 'true'
+      # Defaults resolve to the CALLER's context — no need to pass these.
+      repo:
+        required: false
+        type: string
+        default: ${{ github.repository }}
+      branch:
+        required: false
+        type: string
+        default: ${{ github.ref_name }}
+      actor:
+        required: false
+        type: string
+        default: ${{ github.actor }}
+      run_id:
+        required: false
+        type: string
+        default: ${{ github.run_id }}
+    secrets:
+      # ⚠ Deliberately TWO SEPARATE secrets, always caller-supplied.
+      #   A reusable workflow never inherits secrets implicitly.
+      SLACK_BOT_TOKEN:
+        description: 'Slack bot token (xoxb-…), scope chat:write, bot invited to channel'
+        required: true
+      SLACK_CHANNEL_ID:
+        description: 'Slack channel ID (C0…)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Send Slack notification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build payload & send
+        shell: bash
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+          STATUS:         ${{ inputs.status }}
+          TITLE:          ${{ inputs.title }}
+          DETAIL:         ${{ inputs.detail }}
+          IMAGE_REF:      ${{ inputs.image_ref }}
+          IMAGE_TAG:      ${{ inputs.image_tag }}
+          IMAGE_DIGEST:   ${{ inputs.image_digest }}
+          DOCKERHUB_REPO: ${{ inputs.dockerhub_repo }}
+          SCAN_SUMMARY:   ${{ inputs.scan_summary }}
+          PING_CHANNEL:   ${{ inputs.ping_channel }}
+          IN_REPO:        ${{ inputs.repo }}
+          IN_BRANCH:      ${{ inputs.branch }}
+          IN_ACTOR:       ${{ inputs.actor }}
+          IN_RUN_ID:      ${{ inputs.run_id }}
+          GITHUB_SHA_VAL: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          for v in SLACK_BOT_TOKEN SLACK_CHANNEL_ID; do
+            if [ -z "${!v}" ]; then
+              echo "::error::${v} is empty — the caller must pass it via its `secrets:` block."
+              exit 1
+            fi
+          done
+
+          SHA_SHORT="${GITHUB_SHA_VAL:0:7}"
+          RUN_URL="https://github.com/${IN_REPO}/actions/runs/${IN_RUN_ID}"
+          COMMIT_URL="https://github.com/${IN_REPO}/commit/${GITHUB_SHA_VAL}"
+
+          PING=""
+          if [ "${PING_CHANNEL}" = "true" ] \
+             && [ "${STATUS}" != "cancelled" ] && [ "${STATUS}" != "skipped" ]; then
+            PING="<!channel> "
+          fi
+
+          # ── classify ──────────────────────────────────────────────────────
+          case "${STATUS}" in
+            success)
+              if [ -n "${IMAGE_REF}" ] && [ -n "${IMAGE_DIGEST}" ]; then
+                HEADER=":rocket: ${TITLE} — published"
+                SUMMARY="${PING}\`${IMAGE_REF}\` was pushed and is ready to pull."
+              else
+                HEADER=":white_check_mark: ${TITLE} — passed"
+                SUMMARY="${PING}The pipeline finished successfully."
+              fi
+              ;;
+            failure)
+              HEADER=":x: ${TITLE} — FAILED"
+              SUMMARY="${PING}The pipeline failed — check the run before retriggering deployments."
+              ;;
+            cancelled)
+              HEADER=":octagonal_sign: ${TITLE} — cancelled"
+              SUMMARY="The run was cancelled."
+              ;;
+            skipped)
+              HEADER=":fast_forward: ${TITLE} — skipped"
+              SUMMARY="The watched job did not run (its condition was not met)."
+              ;;
+            *)
+              HEADER=":grey_question: ${TITLE} — ${STATUS}"
+              SUMMARY=""
+              ;;
+          esac
+
+          if [ -n "${DETAIL}" ]; then
+            [ -n "${SUMMARY}" ] && SUMMARY="${SUMMARY}"$'\n'
+            SUMMARY="${SUMMARY}:information_source: ${DETAIL}"
+          fi
+
+          # ── blocks ────────────────────────────────────────────────────────
+          header_block=$(jq -nc --arg t "${HEADER}" \
+            '{type:"header",text:{type:"plain_text",text:$t,emoji:true}}')
+
+          summary_block=$(jq -nc --arg t "${SUMMARY}" \
+            '{type:"section",text:{type:"mrkdwn",text:$t}}')
+
+          fields_block=$(jq -nc \
+            --arg repo "${IN_REPO}" --arg branch "${IN_BRANCH}" --arg actor "${IN_ACTOR}" \
+            --arg tag "${IMAGE_TAG}" --arg digest "${IMAGE_DIGEST}" --arg scan "${SCAN_SUMMARY}" \
+            '[
+               {type:"mrkdwn",text:(":receipt: *Repository*\n`"+$repo+"`")},
+               {type:"mrkdwn",text:(":herb: *Branch*\n`"+$branch+"`")}
+             ]
+             + ( if $tag != ""    then [{type:"mrkdwn",text:(":label: *Image tag*\n`"+$tag+"`")}]  else [] end )
+             + ( if $digest != "" then [{type:"mrkdwn",text:(":key: *Digest*\n`"+$digest+"`")}]    else [] end )
+             + ( if $scan != ""   then [{type:"mrkdwn",text:(":shield: *Scan*\n"+$scan)}]          else [] end )
+             + [{type:"mrkdwn",text:(":bust_in_silhouette: *Triggered by*\n"+$actor)}]
+             | {type:"section",fields:.}')
+
+          run_button="$(jq -nc --arg u "${RUN_URL}" \
+            '{type:"button",text:{type:"plain_text",text:":github: View workflow run",emoji:true},url:$u}')"
+
+          # Docker Hub button only for a genuinely published image.
+          if [ -n "${DOCKERHUB_REPO}" ] && [ -n "${IMAGE_DIGEST}" ]; then
+            HUB_URL="https://hub.docker.com/r/${DOCKERHUB_REPO}/tags?name=${IMAGE_TAG}"
+            hub_button="$(jq -nc --arg u "${HUB_URL}" \
+              '{type:"button",text:{type:"plain_text",text:":whale: View on Docker Hub",emoji:true},url:$u}')"
+            actions_block="$(printf '%s\n' "${hub_button}" "${run_button}" \
+              | jq -s '{type:"actions",elements:.}')"
+          else
+            actions_block="$(printf '%s\n' "${run_button}" \
+              | jq -s '{type:"actions",elements:.}')"
+          fi
+
+          context_block=$(jq -nc \
+            --arg t "<${RUN_URL}|Run ${IN_RUN_ID}> · <${COMMIT_URL}|commit ${SHA_SHORT}>" \
+            '{type:"context",elements:[{type:"mrkdwn",text:$t}]}')
+
+          # Plain-text fallback (drives the phone/desktop notification preview).
+          case "${STATUS}" in
+            success)
+              if [ -n "${IMAGE_REF}" ] && [ -n "${IMAGE_DIGEST}" ]; then
+                FALLBACK="${PING}:rocket: ${IN_REPO} — published ${IMAGE_REF} (${IMAGE_DIGEST}) from ${IN_BRANCH}"
+              else
+                FALLBACK="${PING}:white_check_mark: ${IN_REPO} — ${TITLE} passed on ${IN_BRANCH}"
+              fi ;;
+            failure)   FALLBACK="${PING}:x: ${IN_REPO} — ${TITLE} FAILED on ${IN_BRANCH}. Check the run." ;;
+            cancelled) FALLBACK="${IN_REPO} — ${TITLE} cancelled on ${IN_BRANCH}" ;;
+            skipped)   FALLBACK="${IN_REPO} — ${TITLE} skipped on ${IN_BRANCH}" ;;
+            *)         FALLBACK="${IN_REPO} — ${TITLE}: ${STATUS} on ${IN_BRANCH}" ;;
+          esac
+
+          # ── send ──────────────────────────────────────────────────────────
+          payload="$(printf '%s\n' "${header_block}" "${summary_block}" "${fields_block}" \
+                           "${actions_block}" "${context_block}" \
+            | jq -s --arg channel "${SLACK_CHANNEL_ID}" --arg text "${FALLBACK}" \
+                '{channel:$channel, text:$text, unfurl_links:false, unfurl_media:false, blocks:.}')"
+
+          response="$(curl -sS -X POST 'https://slack.com/api/chat.postMessage' \
+            -H "Authorization: Bearer ${SLACK_BOT_TOKEN}" \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            --data "${payload}")"
+
+          if [ "$(jq -r '.ok' <<<"${response}")" != "true" ]; then
+            echo "::warning title=Slack notification failed::chat.postMessage returned: ${response}"
+            echo "Common causes: invalid token (invalid_auth), bot not invited to the channel (not_in_channel), missing chat:write scope."
+            exit 1
+          fi
+          echo "Slack notification delivered to ${SLACK_CHANNEL_ID} (${STATUS})."
