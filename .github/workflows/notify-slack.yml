@@ -20,7 +20,7 @@
 #   what makes it safe to publish this repo publicly.
 #
 # Message shapes:
-#   success + image_ref + image_digest → ":rocket: published" + Docker Hub button
+#   success + image_ref + image_digest → "published" + Docker Hub button
 #   success without digest             → ":white_check_mark: passed"
 #   failure                            → ":x: FAILED" (+ optional blocked reason)
 #   cancelled / skipped                → quiet note, no @channel ping
@@ -34,6 +34,15 @@
 #
 # Uses only preinstalled jq + curl — NO third-party actions — so no caller's
 # allowed-actions policy can block it.
+#
+# Layout (single section, hand-written style):
+#   :emoji: *Title — outcome*        ← one bold header line
+#   <!channel>                        ← own line, only when ping enabled
+#   one short summary line
+#   • Branch: `…`                    ← bullet metadata, only what's relevant
+#   • Tag / Digest / Scan / Triggered by
+#   [View run] [Docker Hub]          ← buttons
+#   repo · run · commit              ← small grey footer line
 # =============================================================================
 name: Notify Slack (Reusable)
 
@@ -143,84 +152,83 @@ jobs:
 
           for v in SLACK_BOT_TOKEN SLACK_CHANNEL_ID; do
             if [ -z "${!v}" ]; then
-              echo "::error::${v} is empty — the caller must pass it via its `secrets:` block."
+              echo "::error::${v} is empty — the caller must pass it via its \`secrets:\` block."
               exit 1
             fi
           done
 
           SHA_SHORT="${GITHUB_SHA_VAL:0:7}"
+          # Full digests are 71 chars — show sha256: + 12 hex chars, enough to identify.
+          DIGEST_SHORT="${IMAGE_DIGEST:0:19}"
           RUN_URL="https://github.com/${IN_REPO}/actions/runs/${IN_RUN_ID}"
           COMMIT_URL="https://github.com/${IN_REPO}/commit/${GITHUB_SHA_VAL}"
 
+          # ── classify ──────────────────────────────────────────────────────
           PING=""
           if [ "${PING_CHANNEL}" = "true" ] \
              && [ "${STATUS}" != "cancelled" ] && [ "${STATUS}" != "skipped" ]; then
-            PING="<!channel> "
+            PING="<!channel>"
           fi
 
-          # ── classify ──────────────────────────────────────────────────────
           case "${STATUS}" in
             success)
               if [ -n "${IMAGE_REF}" ] && [ -n "${IMAGE_DIGEST}" ]; then
-                HEADER=":rocket: ${TITLE} — published"
-                SUMMARY="${PING}\`${IMAGE_REF}\` was pushed and is ready to pull."
+                HEADER="*${TITLE} — published*"
+                SUMMARY="\`${IMAGE_REF}\` is pushed and ready to pull."
               else
-                HEADER=":white_check_mark: ${TITLE} — passed"
-                SUMMARY="${PING}The pipeline finished successfully."
+                HEADER=":white_check_mark: *${TITLE} — passed*"
+                SUMMARY="Pipeline completed successfully."
               fi
               ;;
             failure)
-              HEADER=":x: ${TITLE} — FAILED"
-              SUMMARY="${PING}The pipeline failed — check the run before retriggering deployments."
+              HEADER=":x: *${TITLE} — failed*"
+              SUMMARY="Check the run before retriggering deployments."
               ;;
             cancelled)
-              HEADER=":octagonal_sign: ${TITLE} — cancelled"
+              HEADER=":octagonal_sign: *${TITLE} — cancelled*"
               SUMMARY="The run was cancelled."
               ;;
             skipped)
-              HEADER=":fast_forward: ${TITLE} — skipped"
+              HEADER=":fast_forward: *${TITLE} — skipped*"
               SUMMARY="The watched job did not run (its condition was not met)."
               ;;
             *)
-              HEADER=":grey_question: ${TITLE} — ${STATUS}"
+              HEADER=":grey_question: *${TITLE} — ${STATUS}*"
               SUMMARY=""
               ;;
           esac
 
-          if [ -n "${DETAIL}" ]; then
-            [ -n "${SUMMARY}" ] && SUMMARY="${SUMMARY}"$'\n'
-            SUMMARY="${SUMMARY}:information_source: ${DETAIL}"
+          # ── message body ──────────────────────────────────────────────────
+          # Hand-written style: one bold header line, then short lines/bullets.
+          # Built in bash — \` inside double quotes is a literal backtick
+          # (jq must never see one: it parses backticks as interpolation).
+          TEXT="${HEADER}"
+          if [ -n "${PING}" ];    then TEXT="${TEXT}"$'\n'"${PING}"; fi
+          if [ -n "${SUMMARY}" ]; then TEXT="${TEXT}"$'\n'"${SUMMARY}"; fi
+          if [ -n "${DETAIL}" ];  then TEXT="${TEXT}"$'\n'":warning: ${DETAIL}"; fi
+
+          # Metadata bullets — only for ran pipelines, and only what's present.
+          if [ "${STATUS}" = "success" ] || [ "${STATUS}" = "failure" ]; then
+            TEXT="${TEXT}"$'\n'"• Branch: \`${IN_BRANCH}\`"
+            if [ -n "${IMAGE_TAG}" ];    then TEXT="${TEXT}"$'\n'"• Tag: \`${IMAGE_TAG}\`"; fi
+            if [ -n "${DIGEST_SHORT}" ]; then TEXT="${TEXT}"$'\n'"• Digest: \`${DIGEST_SHORT}…\`"; fi
+            if [ -n "${SCAN_SUMMARY}" ]; then TEXT="${TEXT}"$'\n'"• Scan: ${SCAN_SUMMARY}"; fi
+            TEXT="${TEXT}"$'\n'"• Triggered by: ${IN_ACTOR}"
           fi
 
           # ── blocks ────────────────────────────────────────────────────────
-          header_block=$(jq -nc --arg t "${HEADER}" \
-            '{type:"header",text:{type:"plain_text",text:$t,emoji:true}}')
-
-          summary_block=$(jq -nc --arg t "${SUMMARY}" \
+          section_block=$(jq -nc --arg t "${TEXT}" \
             '{type:"section",text:{type:"mrkdwn",text:$t}}')
 
-          fields_block=$(jq -nc \
-            --arg repo "${IN_REPO}" --arg branch "${IN_BRANCH}" --arg actor "${IN_ACTOR}" \
-            --arg tag "${IMAGE_TAG}" --arg digest "${IMAGE_DIGEST}" --arg scan "${SCAN_SUMMARY}" \
-            '[
-               {type:"mrkdwn",text:(":receipt: *Repository*\n`"+$repo+"`")},
-               {type:"mrkdwn",text:(":herb: *Branch*\n`"+$branch+"`")}
-             ]
-             + ( if $tag != ""    then [{type:"mrkdwn",text:(":label: *Image tag*\n`"+$tag+"`")}]  else [] end )
-             + ( if $digest != "" then [{type:"mrkdwn",text:(":key: *Digest*\n`"+$digest+"`")}]    else [] end )
-             + ( if $scan != ""   then [{type:"mrkdwn",text:(":shield: *Scan*\n"+$scan)}]          else [] end )
-             + [{type:"mrkdwn",text:(":bust_in_silhouette: *Triggered by*\n"+$actor)}]
-             | {type:"section",fields:.}')
-
           run_button="$(jq -nc --arg u "${RUN_URL}" \
-            '{type:"button",text:{type:"plain_text",text:":github: View workflow run",emoji:true},url:$u}')"
+            '{type:"button",text:{type:"plain_text",text:"View run",emoji:true},url:$u}')"
 
           # Docker Hub button only for a genuinely published image.
           if [ -n "${DOCKERHUB_REPO}" ] && [ -n "${IMAGE_DIGEST}" ]; then
             HUB_URL="https://hub.docker.com/r/${DOCKERHUB_REPO}/tags?name=${IMAGE_TAG}"
             hub_button="$(jq -nc --arg u "${HUB_URL}" \
-              '{type:"button",text:{type:"plain_text",text:":whale: View on Docker Hub",emoji:true},url:$u}')"
-            actions_block="$(printf '%s\n' "${hub_button}" "${run_button}" \
+              '{type:"button",text:{type:"plain_text",text:"Docker Hub",emoji:true},url:$u}')"
+            actions_block="$(printf '%s\n' "${run_button}" "${hub_button}" \
               | jq -s '{type:"actions",elements:.}')"
           else
             actions_block="$(printf '%s\n' "${run_button}" \
@@ -228,26 +236,25 @@ jobs:
           fi
 
           context_block=$(jq -nc \
-            --arg t "<${RUN_URL}|Run ${IN_RUN_ID}> · <${COMMIT_URL}|commit ${SHA_SHORT}>" \
+            --arg t "<${RUN_URL}|${IN_REPO} · run ${IN_RUN_ID}> · <${COMMIT_URL}|commit ${SHA_SHORT}>" \
             '{type:"context",elements:[{type:"mrkdwn",text:$t}]}')
 
           # Plain-text fallback (drives the phone/desktop notification preview).
           case "${STATUS}" in
             success)
               if [ -n "${IMAGE_REF}" ] && [ -n "${IMAGE_DIGEST}" ]; then
-                FALLBACK="${PING}:rocket: ${IN_REPO} — published ${IMAGE_REF} (${IMAGE_DIGEST}) from ${IN_BRANCH}"
+                FALLBACK="${PING}${TITLE}: ${IMAGE_TAG:-$IMAGE_REF} published on ${IN_BRANCH} (${IN_REPO})"
               else
-                FALLBACK="${PING}:white_check_mark: ${IN_REPO} — ${TITLE} passed on ${IN_BRANCH}"
+                FALLBACK="${PING}${TITLE} passed on ${IN_BRANCH} (${IN_REPO})"
               fi ;;
-            failure)   FALLBACK="${PING}:x: ${IN_REPO} — ${TITLE} FAILED on ${IN_BRANCH}. Check the run." ;;
-            cancelled) FALLBACK="${IN_REPO} — ${TITLE} cancelled on ${IN_BRANCH}" ;;
-            skipped)   FALLBACK="${IN_REPO} — ${TITLE} skipped on ${IN_BRANCH}" ;;
-            *)         FALLBACK="${IN_REPO} — ${TITLE}: ${STATUS} on ${IN_BRANCH}" ;;
+            failure)   FALLBACK="${PING}${TITLE} FAILED on ${IN_BRANCH} (${IN_REPO})" ;;
+            cancelled) FALLBACK="${TITLE} cancelled on ${IN_BRANCH} (${IN_REPO})" ;;
+            skipped)   FALLBACK="${TITLE} skipped on ${IN_BRANCH} (${IN_REPO})" ;;
+            *)         FALLBACK="${TITLE}: ${STATUS} on ${IN_BRANCH} (${IN_REPO})" ;;
           esac
 
           # ── send ──────────────────────────────────────────────────────────
-          payload="$(printf '%s\n' "${header_block}" "${summary_block}" "${fields_block}" \
-                           "${actions_block}" "${context_block}" \
+          payload="$(printf '%s\n' "${section_block}" "${actions_block}" "${context_block}" \
             | jq -s --arg channel "${SLACK_CHANNEL_ID}" --arg text "${FALLBACK}" \
                 '{channel:$channel, text:$text, unfurl_links:false, unfurl_media:false, blocks:.}')"
 
