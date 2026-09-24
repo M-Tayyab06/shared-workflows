@@ -7,7 +7,7 @@
 #     slack-notify:
 #       needs: my-publish-job
 #       if: always()
-#       uses: M-Tayyab06/shared-workflows/.github/workflows/notify-slack.yml@v1
+#       uses: M-Tayyab06/shared-workflows/.github/workflows/notify-slack.yml@v3
 #       with:
 #         status: ${{ needs.my-publish-job.result }}
 #         title: 'My pipeline'
@@ -15,7 +15,7 @@
 #         SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
 #         SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
 #
-# ⚠ THIS FILE CONTAINS NO SECRETS — and must NEVER contain any. Every caller
+#   THIS FILE CONTAINS NO SECRETS — and must NEVER contain any. Every caller
 #   brings its own Slack token and channel via the `secrets:` block. That is
 #   what makes it safe to publish this repo publicly.
 #
@@ -36,13 +36,19 @@
 # allowed-actions policy can block it.
 #
 # Layout (single section, hand-written style):
+#   <repo link>                       ← own line, always first
 #   :emoji: *Title — outcome*        ← one bold header line
 #   <!channel>                        ← own line, only when ping enabled
 #   one short summary line
 #   • Branch: `…`                    ← bullet metadata, only what's relevant
-#   • Tag / Digest / Scan / Triggered by
+#   • Tag / Digest (full sha256:…) / Scan / Triggered by
 #   [View run] [Docker Hub]          ← buttons
 #   repo · run · commit              ← small grey footer line
+#
+# Note: keep `image_tag` a BARE tag (e.g. "v3.1.5") — it also drives the
+# Docker Hub button URL. The "Tag" bullet and fallback text display the full
+# "dockerhub_repo:image_tag" reference automatically when `dockerhub_repo`
+# is set.
 # =============================================================================
 name: Notify Slack (Reusable)
 
@@ -93,7 +99,6 @@ on:
         required: false
         type: string
         default: 'true'
-      # Defaults resolve to the CALLER's context — no need to pass these.
       repo:
         required: false
         type: string
@@ -111,8 +116,6 @@ on:
         type: string
         default: ${{ github.run_id }}
     secrets:
-      # ⚠ Deliberately TWO SEPARATE secrets, always caller-supplied.
-      #   A reusable workflow never inherits secrets implicitly.
       SLACK_BOT_TOKEN:
         description: 'Slack bot token (xoxb-…), scope chat:write, bot invited to channel'
         required: true
@@ -158,8 +161,18 @@ jobs:
           done
 
           SHA_SHORT="${GITHUB_SHA_VAL:0:7}"
-          # Full digests are 71 chars — show sha256: + 12 hex chars, enough to identify.
-          DIGEST_SHORT="${IMAGE_DIGEST:0:19}"
+          # Full digest shown as-is (caller may want the complete sha256:… value).
+          DIGEST_SHORT="${IMAGE_DIGEST}"
+
+          # Full "repo:tag" for display in the message. IMAGE_TAG itself stays
+          # bare (it's also used verbatim to build the Docker Hub button URL).
+          if [ -n "${DOCKERHUB_REPO}" ] && [ -n "${IMAGE_TAG}" ]; then
+            FULL_IMAGE_REF="${DOCKERHUB_REPO}:${IMAGE_TAG}"
+          elif [ -n "${IMAGE_REF}" ]; then
+            FULL_IMAGE_REF="${IMAGE_REF}"
+          else
+            FULL_IMAGE_REF="${IMAGE_TAG}"
+          fi
           RUN_URL="https://github.com/${IN_REPO}/actions/runs/${IN_RUN_ID}"
           COMMIT_URL="https://github.com/${IN_REPO}/commit/${GITHUB_SHA_VAL}"
 
@@ -202,7 +215,8 @@ jobs:
           # Hand-written style: one bold header line, then short lines/bullets.
           # Built in bash — \` inside double quotes is a literal backtick
           # (jq must never see one: it parses backticks as interpolation).
-          TEXT="${HEADER}"
+          REPO_LINK="<https://github.com/${IN_REPO}|${IN_REPO}>"
+          TEXT="${REPO_LINK}"$'\n'"${HEADER}"
           if [ -n "${PING}" ];    then TEXT="${TEXT}"$'\n'"${PING}"; fi
           if [ -n "${SUMMARY}" ]; then TEXT="${TEXT}"$'\n'"${SUMMARY}"; fi
           if [ -n "${DETAIL}" ];  then TEXT="${TEXT}"$'\n'":warning: ${DETAIL}"; fi
@@ -210,8 +224,8 @@ jobs:
           # Metadata bullets — only for ran pipelines, and only what's present.
           if [ "${STATUS}" = "success" ] || [ "${STATUS}" = "failure" ]; then
             TEXT="${TEXT}"$'\n'"• Branch: \`${IN_BRANCH}\`"
-            if [ -n "${IMAGE_TAG}" ];    then TEXT="${TEXT}"$'\n'"• Tag: \`${IMAGE_TAG}\`"; fi
-            if [ -n "${DIGEST_SHORT}" ]; then TEXT="${TEXT}"$'\n'"• Digest: \`${DIGEST_SHORT}…\`"; fi
+            if [ -n "${IMAGE_TAG}" ];    then TEXT="${TEXT}"$'\n'"• Tag: \`${FULL_IMAGE_REF}\`"; fi
+            if [ -n "${DIGEST_SHORT}" ]; then TEXT="${TEXT}"$'\n'"• Digest: \`${DIGEST_SHORT}\`"; fi
             if [ -n "${SCAN_SUMMARY}" ]; then TEXT="${TEXT}"$'\n'"• Scan: ${SCAN_SUMMARY}"; fi
             TEXT="${TEXT}"$'\n'"• Triggered by: ${IN_ACTOR}"
           fi
@@ -243,7 +257,7 @@ jobs:
           case "${STATUS}" in
             success)
               if [ -n "${IMAGE_REF}" ] && [ -n "${IMAGE_DIGEST}" ]; then
-                FALLBACK="${PING}${TITLE}: ${IMAGE_TAG:-$IMAGE_REF} published on ${IN_BRANCH} (${IN_REPO})"
+                FALLBACK="${PING}${TITLE}: ${FULL_IMAGE_REF} published on ${IN_BRANCH} (${IN_REPO})"
               else
                 FALLBACK="${PING}${TITLE} passed on ${IN_BRANCH} (${IN_REPO})"
               fi ;;
