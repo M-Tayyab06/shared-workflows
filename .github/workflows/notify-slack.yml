@@ -36,19 +36,19 @@
 # allowed-actions policy can block it.
 #
 # Layout (single section, hand-written style):
-#   <repo link>                       ← own line, always first
-#   :emoji: *Title — outcome*        ← one bold header line
+#   *Image pushed to DockerHub*      ← bold header (publish case)
 #   <!channel>                        ← own line, only when ping enabled
-#   one short summary line
-#   • Branch: `…`                    ← bullet metadata, only what's relevant
-#   • Tag / Digest (full sha256:…) / Scan / Triggered by
-#   [View run] [Docker Hub]          ← buttons
-#   repo · run · commit              ← small grey footer line
+#   • Repo Link: <link>               ← bullet, plain mrkdwn link
+#   • Branch / Tag (short name:tag, no namespace) / Digest (code span) / Scan / Triggered by
+#   repo · run · commit               ← small grey footer line, plain links
 #
-# Note: keep `image_tag` a BARE tag (e.g. "v3.1.5") — it also drives the
-# Docker Hub button URL. The "Tag" bullet and fallback text display the full
-# "dockerhub_repo:image_tag" reference automatically when `dockerhub_repo`
-# is set.
+# Deliberately NO button/actions block: Slack's "App has not been configured
+# for this feature" error appears for `type: "button"` elements when the
+# Slack app doesn't have Interactivity enabled. Plain mrkdwn links avoid it.
+#
+# Note: `image_tag` stays a BARE tag (e.g. "v3.1.5"). The "Tag" bullet shows
+# it alongside the image's short name (namespace stripped from
+# `dockerhub_repo`, e.g. "astabeast5/test-app-image" → "test-app-image").
 # =============================================================================
 name: Notify Slack (Reusable)
 
@@ -99,6 +99,7 @@ on:
         required: false
         type: string
         default: 'true'
+      # Defaults resolve to the CALLER's context — no need to pass these.
       repo:
         required: false
         type: string
@@ -116,6 +117,8 @@ on:
         type: string
         default: ${{ github.run_id }}
     secrets:
+      # ⚠ Deliberately TWO SEPARATE secrets, always caller-supplied.
+      #   A reusable workflow never inherits secrets implicitly.
       SLACK_BOT_TOKEN:
         description: 'Slack bot token (xoxb-…), scope chat:write, bot invited to channel'
         required: true
@@ -164,14 +167,28 @@ jobs:
           # Full digest shown as-is (caller may want the complete sha256:… value).
           DIGEST_SHORT="${IMAGE_DIGEST}"
 
-          # Full "repo:tag" for display in the message. IMAGE_TAG itself stays
-          # bare (it's also used verbatim to build the Docker Hub button URL).
+          # Full "repo:tag" is still used for the Docker Hub deep-link URL.
           if [ -n "${DOCKERHUB_REPO}" ] && [ -n "${IMAGE_TAG}" ]; then
             FULL_IMAGE_REF="${DOCKERHUB_REPO}:${IMAGE_TAG}"
           elif [ -n "${IMAGE_REF}" ]; then
             FULL_IMAGE_REF="${IMAGE_REF}"
           else
             FULL_IMAGE_REF="${IMAGE_TAG}"
+          fi
+
+          # Short display name (namespace stripped) for the "Tag" bullet,
+          # e.g. "astabeast5/test-app-image" → "test-app-image".
+          if [ -n "${DOCKERHUB_REPO}" ]; then
+            IMAGE_SHORT_NAME="${DOCKERHUB_REPO##*/}"
+          elif [ -n "${IMAGE_REF}" ]; then
+            IMAGE_SHORT_NAME="${IMAGE_REF##*/}"
+          else
+            IMAGE_SHORT_NAME=""
+          fi
+          if [ -n "${IMAGE_SHORT_NAME}" ] && [ -n "${IMAGE_TAG}" ]; then
+            TAG_DISPLAY="${IMAGE_SHORT_NAME}:${IMAGE_TAG}"
+          else
+            TAG_DISPLAY="${FULL_IMAGE_REF}"
           fi
           RUN_URL="https://github.com/${IN_REPO}/actions/runs/${IN_RUN_ID}"
           COMMIT_URL="https://github.com/${IN_REPO}/commit/${GITHUB_SHA_VAL}"
@@ -186,8 +203,8 @@ jobs:
           case "${STATUS}" in
             success)
               if [ -n "${IMAGE_REF}" ] && [ -n "${IMAGE_DIGEST}" ]; then
-                HEADER="*${TITLE} — published*"
-                SUMMARY="\`${IMAGE_REF}\` is pushed and ready to pull."
+                HEADER="*Image pushed to DockerHub*"
+                SUMMARY=""
               else
                 HEADER=":white_check_mark: *${TITLE} — passed*"
                 SUMMARY="Pipeline completed successfully."
@@ -215,39 +232,28 @@ jobs:
           # Hand-written style: one bold header line, then short lines/bullets.
           # Built in bash — \` inside double quotes is a literal backtick
           # (jq must never see one: it parses backticks as interpolation).
-          REPO_LINK="<https://github.com/${IN_REPO}|${IN_REPO}>"
-          TEXT="${REPO_LINK}"$'\n'"${HEADER}"
+          TEXT="${HEADER}"
           if [ -n "${PING}" ];    then TEXT="${TEXT}"$'\n'"${PING}"; fi
           if [ -n "${SUMMARY}" ]; then TEXT="${TEXT}"$'\n'"${SUMMARY}"; fi
           if [ -n "${DETAIL}" ];  then TEXT="${TEXT}"$'\n'":warning: ${DETAIL}"; fi
 
           # Metadata bullets — only for ran pipelines, and only what's present.
           if [ "${STATUS}" = "success" ] || [ "${STATUS}" = "failure" ]; then
-            TEXT="${TEXT}"$'\n'"• Branch: \`${IN_BRANCH}\`"
-            if [ -n "${IMAGE_TAG}" ];    then TEXT="${TEXT}"$'\n'"• Tag: \`${FULL_IMAGE_REF}\`"; fi
+            TEXT="${TEXT}"$'\n'"• Repo Link: <https://github.com/${IN_REPO}|${IN_REPO}>"
+            TEXT="${TEXT}"$'\n'"• Branch: ${IN_BRANCH}"
+            if [ -n "${IMAGE_TAG}" ];    then TEXT="${TEXT}"$'\n'"• Tag: ${TAG_DISPLAY}"; fi
             if [ -n "${DIGEST_SHORT}" ]; then TEXT="${TEXT}"$'\n'"• Digest: \`${DIGEST_SHORT}\`"; fi
             if [ -n "${SCAN_SUMMARY}" ]; then TEXT="${TEXT}"$'\n'"• Scan: ${SCAN_SUMMARY}"; fi
             TEXT="${TEXT}"$'\n'"• Triggered by: ${IN_ACTOR}"
           fi
 
           # ── blocks ────────────────────────────────────────────────────────
+          # Plain link-only elements below — deliberately NO "actions" block
+          # with interactive buttons. Slack rejects button elements with
+          # "App has not been configured for this feature" unless the app
+          # has Interactivity enabled; plain mrkdwn links avoid that entirely.
           section_block=$(jq -nc --arg t "${TEXT}" \
             '{type:"section",text:{type:"mrkdwn",text:$t}}')
-
-          run_button="$(jq -nc --arg u "${RUN_URL}" \
-            '{type:"button",text:{type:"plain_text",text:"View run",emoji:true},url:$u}')"
-
-          # Docker Hub button only for a genuinely published image.
-          if [ -n "${DOCKERHUB_REPO}" ] && [ -n "${IMAGE_DIGEST}" ]; then
-            HUB_URL="https://hub.docker.com/r/${DOCKERHUB_REPO}/tags?name=${IMAGE_TAG}"
-            hub_button="$(jq -nc --arg u "${HUB_URL}" \
-              '{type:"button",text:{type:"plain_text",text:"Docker Hub",emoji:true},url:$u}')"
-            actions_block="$(printf '%s\n' "${run_button}" "${hub_button}" \
-              | jq -s '{type:"actions",elements:.}')"
-          else
-            actions_block="$(printf '%s\n' "${run_button}" \
-              | jq -s '{type:"actions",elements:.}')"
-          fi
 
           context_block=$(jq -nc \
             --arg t "<${RUN_URL}|${IN_REPO} · run ${IN_RUN_ID}> · <${COMMIT_URL}|commit ${SHA_SHORT}>" \
@@ -268,7 +274,7 @@ jobs:
           esac
 
           # ── send ──────────────────────────────────────────────────────────
-          payload="$(printf '%s\n' "${section_block}" "${actions_block}" "${context_block}" \
+          payload="$(printf '%s\n' "${section_block}" "${context_block}" \
             | jq -s --arg channel "${SLACK_CHANNEL_ID}" --arg text "${FALLBACK}" \
                 '{channel:$channel, text:$text, unfurl_links:false, unfurl_media:false, blocks:.}')"
 
